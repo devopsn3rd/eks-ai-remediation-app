@@ -1,0 +1,150 @@
+# CI only: build, push to ECR, and record the new image tag in the config repo.
+# This workflow has NO access to the cluster. Argo CD notices the commit in the
+# config repo and deploys it (pull-based GitOps).
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "orders-api/**"
+      - "orders-runbook-mcp/**"
+      - "alert-bridge/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Build only this component (empty = all)"
+        type: choice
+        options: ["", "orders-api", "orders-runbook-mcp", "alert-bridge"]
+        default: ""
+
+permissions:
+  id-token: write # GitHub OIDC -> AWS (ECR push role)
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CONFIG_REPO: ${{ github.repository_owner }}/eks-ai-remediation-config
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 1 # one config-repo commit at a time, avoids push races
+      matrix:
+        include:
+          - component: orders-api
+            # file in the config repo + the marker on the line to update
+            target_file: envs/lab/orders-api-values.yaml
+            marker: "agent:image-tag"
+          - component: orders-runbook-mcp
+            target_file: workloads/orders-runbook-mcp/deployment.yaml
+            marker: "ci:image"
+          - component: alert-bridge
+            target_file: workloads/alert-bridge/deployment.yaml
+            marker: "ci:image"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Did this component change?
+        id: changed
+        env:
+          BEFORE: ${{ github.event.before }}
+          INPUT_COMPONENT: ${{ inputs.component }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -z "$INPUT_COMPONENT" ] || [ "$INPUT_COMPONENT" = "$COMPONENT" ]; then
+              echo "build=true" >> "$GITHUB_OUTPUT"; else echo "build=false" >> "$GITHUB_OUTPUT"; fi
+            exit 0
+          fi
+          # First push to a new repo has no "before" commit: build everything.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$BEFORE" "$GITHUB_SHA" | grep -qE "^(${COMPONENT}/|\.github/workflows/ci\.yml)"; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Image tag
+        if: steps.changed.outputs.build == 'true'
+        id: tag
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: steps.changed.outputs.build == 'true'
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_CI }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        if: steps.changed.outputs.build == 'true'
+        id: ecr
+
+      - name: Skip if this tag already exists (tags are immutable)
+        if: steps.changed.outputs.build == 'true'
+        id: exists
+        run: |
+          if aws ecr describe-images --repository-name "${{ matrix.component }}" \
+               --image-ids imageTag="${{ steps.tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.changed.outputs.build == 'true' && steps.exists.outputs.push == 'true'
+
+      - name: Build and push
+        if: steps.changed.outputs.build == 'true' && steps.exists.outputs.push == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.component }}
+          push: true
+          platforms: linux/amd64
+          build-args: APP_VERSION=${{ steps.tag.outputs.tag }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ matrix.component }}:${{ steps.tag.outputs.tag }}
+          provenance: false
+
+      # ----- GitOps hand-off: write the new tag into the config repo -----
+      - name: Checkout config repo
+        if: steps.changed.outputs.build == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.CONFIG_REPO }}
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: config
+
+      - name: Bump image tag in the config repo
+        if: steps.changed.outputs.build == 'true'
+        working-directory: config
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          FILE: ${{ matrix.target_file }}
+          MARKER: ${{ matrix.marker }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          if [ "$MARKER" = "agent:image-tag" ]; then
+            # values file line:  tag: "abc1234"  # agent:image-tag
+            sed -i -E "s|^([[:space:]]*tag:[[:space:]]*)\S+([[:space:]]*# ${MARKER})|\1\"${TAG}\"\2|" "$FILE"
+          else
+            # deployment line:   image: <registry>/<repo>:<tag>  # ci:image
+            sed -i -E "s|^([[:space:]]*image:[[:space:]]*[^:]+:)\S+([[:space:]]*# ${MARKER})|\1${TAG}\2|" "$FILE"
+          fi
+          if git diff --quiet; then echo "Tag already set, nothing to commit."; exit 0; fi
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git commit -am "ci(${COMPONENT}): image ${TAG}"
+          for i in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            sleep 5
+          done
+          echo "Could not push the tag bump after 3 tries" >&2; exit 1
